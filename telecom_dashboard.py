@@ -140,7 +140,7 @@ def parse_cell_name_refined(cell_name):
         sitename = re.sub(r'^[^a-zA-Z0-9_]+', '', sitename)
         # Remove trailing non-alphanumeric chars (e.g., if there were any accidental trailing symbols)
         sitename = re.sub(r'[^a-zA-Z0-9_]+$', '', sitename)
-        if not sitename.strip(): # If it becomes empty after cleaning, make it NaN
+        if not sitename.strip(): # If it becomes empty after stripping, make it NaN
             sitename = np.nan
 
 
@@ -316,24 +316,29 @@ def process_congestion_data(raw_df):
     """
     df = raw_df.copy() # Work on a copy to avoid modifying the original DataFrame in cache
 
+    # --- Guaranteed CATEGORY Column Initialization ---
+    # Initialize CATEGORY column to prevent KeyError
+    df['CATEGORY'] = 'N/A' # Default value if neither 'Date' nor existing 'CATEGORY' found
+
     # --- Automate CATEGORY based on Date column ---
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', infer_datetime_format=True)
         # Drop rows where Date could not be parsed as they are unusable for CATEGORY
+        original_rows_before_date_dropna = len(df)
         df.dropna(subset=['Date'], inplace=True) 
+        if len(df) < original_rows_before_date_dropna:
+            st.warning(f"Dropped {original_rows_before_date_dropna - len(df)} rows due to unparseable dates.")
+        
         df['CATEGORY'] = df['Date'].apply(lambda x: 'weekend' if x.weekday() >= 5 else 'weekday')
         st.success("Date column processed and CATEGORY automated!")
     else:
         st.warning("No 'Date' column found. Attempting to use existing 'CATEGORY' column.")
-        # Fallback to existing CATEGORY column if 'Date' is not present
-        if 'CATEGORY' in df.columns:
+        if 'CATEGORY' in df.columns and not df['CATEGORY'].isnull().all(): # Check if it exists and has non-nulls
             df['CATEGORY'] = df['CATEGORY'].astype(str).str.lower()
             df.loc[df['CATEGORY'] == 'nan', 'CATEGORY'] = np.nan # Ensure 'nan' string is actual NaN
             st.success("Using existing 'CATEGORY' column.")
         else:
-            # If neither 'Date' nor 'CATEGORY' found, create 'CATEGORY' as 'N/A' to prevent KeyErrors
-            df['CATEGORY'] = 'N/A'
-            st.warning("Neither 'Date' nor 'CATEGORY' column found. 'CATEGORY' set to 'N/A' for all rows.")
+            st.warning("Neither 'Date' nor a valid 'CATEGORY' column found. 'CATEGORY' set to 'N/A' for all rows.")
 
 
     # Ensure 'Province', 'Town', and 'Vendor' columns exist and are handled. If not present, create placeholders.
@@ -352,7 +357,7 @@ def process_congestion_data(raw_df):
     all_original_cell_names = df[['Cell Name', 'Province', 'Town', 'Vendor']].drop_duplicates().reset_index(drop=True)
 
 
-    # --- Data Cleaning ---
+    # --- Data Cleaning (continued) ---
     df['PRB_DL_Usage'] = pd.to_numeric(df['PRB_DL_Usage'], errors='coerce')
     df['L.Traffic.User.Avg'] = pd.to_numeric(df['L.Traffic.User.Avg'], errors='coerce')
     # CATEGORY is handled above, so no need for general standardization here.
@@ -431,20 +436,18 @@ def process_congestion_data(raw_df):
     final_results_df['Color Code'] = final_results_df.apply(lambda row: get_color_code(row, color_matrix), axis=1)
     final_results_df['Color Code'] = final_results_df['Color Code'].apply(lambda x: x.upper() if pd.notna(x) else x)
 
-    # --- RENAME 'Color Code' to 'Cell Level Congestion' and 'CELL TO SECTOR COLOR CODING' to 'Sector Level Congestion' ---
+    # --- RENAME 'Color Code' to 'Cell Level Congestion' ---
     # Perform renaming earlier so subsequent logic uses the correct names
     final_results_df.rename(columns={
         'Color Code': 'Cell Level Congestion',
-        'CELL TO SECTOR COLOR CODING': 'Sector Level Congestion'
     }, inplace=True)
 
     # --- Prepare for FINAL ASSESSMENT (Sector-level counts) ---
     # These calculations now use the already renamed 'Cell Level Congestion'
     final_results_df['Is_Good_Cell'] = final_results_df['Cell Level Congestion'].isin(['BLUE', 'GREEN'])
-    final_results_df['Is_Red_Cell'] = final_results_df['Cell Level Congestion'] == 'RED'
+    final_results_df['Is_Red_Cell'] = final_results_df['Cell Level Congestion'] == 'RED' # Keep this for Red_Cells_Count_Sector
 
     # Aggregate Good and Red cell counts per sector based on unique cells
-    # Note: .drop_duplicates(subset=['Cell Name', 'SECTORNAME']) is crucial here to count *unique cells* per sector for aggregation
     sector_level_agg_data = final_results_df.drop_duplicates(subset=['Cell Name', 'SECTORNAME']).groupby('SECTORNAME').agg(
         Good_Cells_Count_Sector=('Is_Good_Cell', 'sum'),
         Red_Cells_Count_Sector=('Is_Red_Cell', 'sum')
@@ -461,31 +464,32 @@ def process_congestion_data(raw_df):
     # --- FINAL ASSESSMENT Column (now 'Cell Level Congestion' exists and counts are merged) ---
     final_results_df['FINAL ASSESSMENT'] = final_results_df.apply(get_final_assessment, axis=1)
 
-    # --- CELL TO SECTOR COLOR CODING Column (must happen AFTER Is_Black_Cell, Is_Red_Cell, Is_Amber_Cell are finalized using the new name) ---
-    # Recalculate Is_Black_Cell and Is_Amber_Cell using the new name 'Cell Level Congestion'
+    # --- CELL TO SECTOR COLOR CODING Column ---
+    # Ensure these are based on the correct 'Cell Level Congestion' column
     final_results_df['Is_Black_Cell'] = final_results_df['Cell Level Congestion'] == 'BLACK'
     final_results_df['Is_Amber_Cell'] = final_results_df['Cell Level Congestion'] == 'AMBER'
     
     # Re-aggregate counts for sector_band_color_counts based on Cell Level Congestion (using unique cells per sector/band)
     sector_band_color_counts = final_results_df.drop_duplicates(subset=['Cell Name', 'SECTORNAME', 'BAND']).groupby(['SECTORNAME', 'BAND']).agg(
-        Black_Cells_Count=(final_results_df['Cell Level Congestion'] == 'BLACK', 'sum'),
-        Red_Cells_Count_for_CTSCC=(final_results_df['Cell Level Congestion'] == 'RED', 'sum'), # Use Cell Level Congestion
-        Amber_Cells_Count=(final_results_df['Cell Level Congestion'] == 'AMBER', 'sum'),
+        Black_Cells_Count=('Is_Black_Cell', 'sum'), # Correctly referencing boolean column
+        Red_Cells_Count_for_CTSCC=('Is_Red_Cell', 'sum'), # Correctly referencing boolean column
+        Amber_Cells_Count=('Is_Amber_Cell', 'sum'), # Correctly referencing boolean column
         Total_Cells_in_Sector_Band=('Cell Name', 'count')
     ).reset_index()
 
+    # Apply get_cell_to_sector_color_coding and then merge
     sector_band_color_counts['Sector Level Congestion Temp'] = sector_band_color_counts.apply(get_cell_to_sector_color_coding, axis=1) 
     
-    # Drop existing 'Sector Level Congestion' if it exists before merging the new one
-    if 'Sector Level Congestion' in final_results_df.columns:
-        final_results_df.drop(columns=['Sector Level Congestion'], inplace=True)
-
+    # Rename 'CELL TO SECTOR COLOR CODING' to 'Sector Level Congestion' AFTER its calculation
+    # Since it's being created and merged with a temp name, then renamed, this should be fine.
+    # The previous rename for 'CELL TO SECTOR COLOR CODING' was causing the KeyError
+    # by renaming a column that didn't exist yet at that specific point.
     final_results_df = pd.merge(
         final_results_df,
         sector_band_color_counts[['SECTORNAME', 'BAND', 'Sector Level Congestion Temp']],
         on=['SECTORNAME', 'BAND'],
         how='left'
-    ).rename(columns={'Sector Level Congestion Temp': 'Sector Level Congestion'}) # Rename after merge
+    ).rename(columns={'Sector Level Congestion Temp': 'Sector Level Congestion'})
 
     # Clean up temporary columns
     final_results_df.drop(columns=[
@@ -505,7 +509,7 @@ def process_congestion_data(raw_df):
 
 # --- Data Loading Section ---
 st.sidebar.header("1. Upload Data")
-uploaded_file = st.sidebar.file_uploader("Upload your CSV file (e.g., CONGESTION WK24.csv)", type=["csv"], accept_multiple_files=False)
+uploaded_file = st.sidebar.file_uploader("Upload your CSV file(s)", type=["csv"], accept_multiple_files=False)
 
 raw_df_single_file = None # Initialize raw DataFrame for single file
 
