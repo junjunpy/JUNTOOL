@@ -316,6 +316,26 @@ def process_congestion_data(raw_df):
     """
     df = raw_df.copy() # Work on a copy to avoid modifying the original DataFrame in cache
 
+    # --- Automate CATEGORY based on Date column ---
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', infer_datetime_format=True)
+        # Drop rows where Date could not be parsed as they are unusable for CATEGORY
+        df.dropna(subset=['Date'], inplace=True) 
+        df['CATEGORY'] = df['Date'].apply(lambda x: 'weekend' if x.weekday() >= 5 else 'weekday')
+        st.success("Date column processed and CATEGORY automated!")
+    else:
+        st.warning("No 'Date' column found. Attempting to use existing 'CATEGORY' column.")
+        # Fallback to existing CATEGORY column if 'Date' is not present
+        if 'CATEGORY' in df.columns:
+            df['CATEGORY'] = df['CATEGORY'].astype(str).str.lower()
+            df.loc[df['CATEGORY'] == 'nan', 'CATEGORY'] = np.nan # Ensure 'nan' string is actual NaN
+            st.success("Using existing 'CATEGORY' column.")
+        else:
+            # If neither 'Date' nor 'CATEGORY' found, create 'CATEGORY' as 'N/A' to prevent KeyErrors
+            df['CATEGORY'] = 'N/A'
+            st.warning("Neither 'Date' nor 'CATEGORY' column found. 'CATEGORY' set to 'N/A' for all rows.")
+
+
     # Ensure 'Province', 'Town', and 'Vendor' columns exist and are handled. If not present, create placeholders.
     if 'Province' not in df.columns:
         df['Province'] = 'N/A'
@@ -335,8 +355,7 @@ def process_congestion_data(raw_df):
     # --- Data Cleaning ---
     df['PRB_DL_Usage'] = pd.to_numeric(df['PRB_DL_Usage'], errors='coerce')
     df['L.Traffic.User.Avg'] = pd.to_numeric(df['L.Traffic.User.Avg'], errors='coerce')
-    df['CATEGORY'] = df['CATEGORY'].str.lower()
-    df.loc[df['CATEGORY'] == 'nan', 'CATEGORY'] = np.nan
+    # CATEGORY is handled above, so no need for general standardization here.
     df.dropna(subset=['PRB_DL_Usage', 'L.Traffic.User.Avg'], how='all', inplace=True)
 
     # --- PRB_DL_Usage Computation ---
@@ -412,11 +431,20 @@ def process_congestion_data(raw_df):
     final_results_df['Color Code'] = final_results_df.apply(lambda row: get_color_code(row, color_matrix), axis=1)
     final_results_df['Color Code'] = final_results_df['Color Code'].apply(lambda x: x.upper() if pd.notna(x) else x)
 
+    # --- RENAME 'Color Code' to 'Cell Level Congestion' and 'CELL TO SECTOR COLOR CODING' to 'Sector Level Congestion' ---
+    # Perform renaming earlier so subsequent logic uses the correct names
+    final_results_df.rename(columns={
+        'Color Code': 'Cell Level Congestion',
+        'CELL TO SECTOR COLOR CODING': 'Sector Level Congestion'
+    }, inplace=True)
+
     # --- Prepare for FINAL ASSESSMENT (Sector-level counts) ---
-    final_results_df['Is_Good_Cell'] = final_results_df['Color Code'].isin(['BLUE', 'GREEN'])
-    final_results_df['Is_Red_Cell'] = final_results_df['Color Code'] == 'RED'
+    # These calculations now use the already renamed 'Cell Level Congestion'
+    final_results_df['Is_Good_Cell'] = final_results_df['Cell Level Congestion'].isin(['BLUE', 'GREEN'])
+    final_results_df['Is_Red_Cell'] = final_results_df['Cell Level Congestion'] == 'RED'
 
     # Aggregate Good and Red cell counts per sector based on unique cells
+    # Note: .drop_duplicates(subset=['Cell Name', 'SECTORNAME']) is crucial here to count *unique cells* per sector for aggregation
     sector_level_agg_data = final_results_df.drop_duplicates(subset=['Cell Name', 'SECTORNAME']).groupby('SECTORNAME').agg(
         Good_Cells_Count_Sector=('Is_Good_Cell', 'sum'),
         Red_Cells_Count_Sector=('Is_Red_Cell', 'sum')
@@ -430,29 +458,23 @@ def process_congestion_data(raw_df):
         how='left'
     )
     
-    # --- RENAME 'Color Code' to 'Cell Level Congestion' and 'CELL TO SECTOR COLOR CODING' to 'Sector Level Congestion' BEFORE calling get_final_assessment ---
-    final_results_df.rename(columns={
-        'Color Code': 'Cell Level Congestion',
-        'CELL TO SECTOR COLOR CODING': 'Sector Level Congestion' # This line might cause KeyError if 'CELL TO SECTOR COLOR CODING' hasn't been created yet
-    }, inplace=True)
-
-    # Recalculate Is_Black_Cell and Is_Amber_Cell using the new name 'Cell Level Congestion'
-    final_results_df['Is_Black_Cell'] = final_results_df['Cell Level Congestion'] == 'BLACK'
-    final_results_df['Is_Amber_Cell'] = final_results_df['Cell Level Congestion'] == 'AMBER'
-
     # --- FINAL ASSESSMENT Column (now 'Cell Level Congestion' exists and counts are merged) ---
     final_results_df['FINAL ASSESSMENT'] = final_results_df.apply(get_final_assessment, axis=1)
 
     # --- CELL TO SECTOR COLOR CODING Column (must happen AFTER Is_Black_Cell, Is_Red_Cell, Is_Amber_Cell are finalized using the new name) ---
-    sector_band_color_counts = final_results_df.groupby(['SECTORNAME', 'BAND']).agg(
-        Black_Cells_Count=('Is_Black_Cell', 'sum'),
-        Red_Cells_Count_for_CTSCC=('Is_Red_Cell', 'sum'), # This still uses the original Is_Red_Cell from before the drop
-        Amber_Cells_Count=('Is_Amber_Cell', 'sum'),
+    # Recalculate Is_Black_Cell and Is_Amber_Cell using the new name 'Cell Level Congestion'
+    final_results_df['Is_Black_Cell'] = final_results_df['Cell Level Congestion'] == 'BLACK'
+    final_results_df['Is_Amber_Cell'] = final_results_df['Cell Level Congestion'] == 'AMBER'
+    
+    # Re-aggregate counts for sector_band_color_counts based on Cell Level Congestion (using unique cells per sector/band)
+    sector_band_color_counts = final_results_df.drop_duplicates(subset=['Cell Name', 'SECTORNAME', 'BAND']).groupby(['SECTORNAME', 'BAND']).agg(
+        Black_Cells_Count=(final_results_df['Cell Level Congestion'] == 'BLACK', 'sum'),
+        Red_Cells_Count_for_CTSCC=(final_results_df['Cell Level Congestion'] == 'RED', 'sum'), # Use Cell Level Congestion
+        Amber_Cells_Count=(final_results_df['Cell Level Congestion'] == 'AMBER', 'sum'),
         Total_Cells_in_Sector_Band=('Cell Name', 'count')
     ).reset_index()
-    
-    # Apply get_cell_to_sector_color_coding and then merge
-    sector_band_color_counts['Sector Level Congestion Temp'] = sector_band_color_counts.apply(get_cell_to_sector_color_coding, axis=1) # Use temp name
+
+    sector_band_color_counts['Sector Level Congestion Temp'] = sector_band_color_counts.apply(get_cell_to_sector_color_coding, axis=1) 
     
     # Drop existing 'Sector Level Congestion' if it exists before merging the new one
     if 'Sector Level Congestion' in final_results_df.columns:
@@ -467,8 +489,8 @@ def process_congestion_data(raw_df):
 
     # Clean up temporary columns
     final_results_df.drop(columns=[
-        'Is_Good_Cell', 'Is_Red_Cell', 'Is_Black_Cell', 'Is_Amber_Cell',
-    ], inplace=True)
+        'Is_Good_Cell', 'Is_Red_Cell', 'Is_Black_Cell', 'Is_Amber_Cell', # These are temporary boolean flags
+    ], inplace=True) # Good_Cells_Count_Sector and Red_Cells_Count_Sector are retained as they are used in get_final_assessment
 
     # Reorder columns for better readability
     ordered_columns = [
