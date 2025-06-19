@@ -51,12 +51,14 @@ def get_weekend_value(series):
 
 def compute_all_days_value(series):
     """
-    Computes the 'all days' value based on non-zero values and count.
-    - If less than 4 non-zero values, average them.
+    Computes the 'all days' value based on non-zero values and count (for PRB/Traffic).
+    - If less than 4 non-zero values, average those non-zero values.
     - If 4 or more non-zero values, average the top 4 highest non-zero values.
     - Returns NaN if no non-zero values.
     """
-    series_non_zero = series.dropna()[series.dropna() != 0] # Filter for non-NaN and non-zero values
+    series_non_zero = series.dropna()
+    series_non_zero = series_non_zero[series_non_zero != 0] # Explicitly filter out zeros here
+    
     count_non_zero = len(series_non_zero)
 
     if count_non_zero == 0:
@@ -78,8 +80,6 @@ def parse_cell_name_refined(cell_name):
     temp_cell_name = cell_name.strip() # Start by stripping whitespace
 
     # Define suffixes to remove using a single regex pattern for efficiency.
-    # Added '_RSS', ' 4TRFS' (with space), ' 4THES' (with space), and ensuring flexibility for digits/letters.
-    # The pattern now also includes a general match for _ followed by numbers/letters at the end.
     suffixes_to_remove_pattern = r'(?:_4RFS|_4TRFS|_INTERIM|_324M|_CSP|__4RFS|_RSS| 4TRFS| 4THES|_R\d+|_L\d+)$'
     temp_cell_name = re.sub(suffixes_to_remove_pattern, '', temp_cell_name)
 
@@ -87,23 +87,16 @@ def parse_cell_name_refined(cell_name):
     last_hyphen_pos = temp_cell_name.rfind('-')
 
     if last_hyphen_pos == -1:
-        # If no hyphen is found in the cleaned name, this format might not be supported yet.
         return np.nan, np.nan, np.nan, np.nan
 
     # --- Extract SECTORID ---
-    # The part of the string after the last hyphen (e.g., "134", "L91", "2")
     part_after_hyphen = temp_cell_name[last_hyphen_pos + 1:]
-    
-    # Find all digits in the part after the hyphen.
-    # The sector_id is "the very last digit on the number after the dash (-)".
-    # This implies we look for any digit in this segment.
     all_digits_in_part_after_hyphen = re.findall(r'\d', part_after_hyphen)
     
     if all_digits_in_part_after_hyphen:
-        sector_id = all_digits_in_part_after_hyphen[-1] # Take the very last digit found
+        sector_id = all_digits_in_part_after_hyphen[-1]
     else:
-        # If no digit is found after the hyphen, sector ID cannot be determined.
-        return np.nan, np.nan, np.nan, np.nan # Early exit as sector_id is essential
+        return np.nan, np.nan, np.nan, np.nan
 
     # Now, the part before the last hyphen is `sitename_band_part`
     sitename_band_part = temp_cell_name[:last_hyphen_pos]
@@ -111,45 +104,33 @@ def parse_cell_name_refined(cell_name):
     # --- Extract BAND and SITENAME ---
     band_found_in_special_case = False
 
-    # Special Case: Handle the '_D' pattern (e.g., "GTCANDUMMNDAUECEBV_D")
-    # If `sitename_band_part` ends with '_D', the band is the character before '_D'.
     if sitename_band_part.endswith('_D'):
-        # Check if there is a capital letter immediately before '_D'
         if len(sitename_band_part) >= 3 and sitename_band_part[-3].isupper():
-            band = sitename_band_part[-3] # The character before '_D'
-            # SITENAME is everything before the band, then append '_D' back.
+            band = sitename_band_part[-3]
             sitename_candidate = sitename_band_part[:-3]
             sitename = sitename_candidate + '_D'
             band_found_in_special_case = True
     
     if not band_found_in_special_case:
-        # General case: last capital letter in `sitename_band_part` is the band.
-        # This handles formats like "SITENAMEBAND" or "SITENAMEXXXBAND" (where XXX are digits/chars)
         all_caps_in_sitename_band_part = re.findall(r'[A-Z]', sitename_band_part)
         if all_caps_in_sitename_band_part:
-            band = all_caps_in_sitename_band_part[-1] # The last capital letter is the band
+            band = all_caps_in_sitename_band_part[-1]
             band_pos = sitename_band_part.rfind(band)
-            sitename_candidate = sitename_band_part[:band_pos] # SITENAME is everything before that last capital letter
+            sitename_candidate = sitename_band_part[:band_pos]
             sitename = sitename_candidate
         else:
-            # If no capital letter found before the hyphen, band cannot be reliably determined.
             band = np.nan
-            sitename = sitename_band_part # Assume the whole pre-hyphen part is sitename, but band is unknown.
+            sitename = sitename_band_part
 
 
-    # Final cleaning of SITENAME: remove any leading/trailing non-alphanumeric characters.
-    # Allowing underscore in sitename as per previous discussions (e.g., GTCANDUMMNDAUECEB_D).
     if pd.notna(sitename) and isinstance(sitename, str):
-        # Remove leading non-alphanumeric chars (e.g., '.' in '.TCFOAVAREVALOILOILOILOW')
         sitename = re.sub(r'^[^a-zA-Z0-9_]+', '', sitename)
-        # Remove trailing non-alphanumeric chars (e.g., if there were any accidental trailing symbols)
         sitename = re.sub(r'[^a-zA-Z0-9_]+$', '', sitename)
-        if not sitename.strip(): # If it becomes empty after stripping, make it NaN
+        if not sitename.strip():
             sitename = np.nan
 
 
     # --- Construct SECTORNAME ---
-    # SECTORNAME is concatenation of SITENAME and SECTORID, only if both are valid.
     if pd.notna(sitename) and pd.notna(sector_id):
         sector_name = f"{sitename}{sector_id}"
     else:
@@ -165,35 +146,31 @@ def calculate_traffic_score(row):
     if pd.isna(traffic_user):
         return np.nan
 
+    if traffic_user == 0: return 0 # Special handling for zero, as per earlier
     if band in ['F', 'W', 'G', 'Q', 'Y']: # 10MHZ
         if traffic_user > 129: return 4
         if traffic_user > 99: return 3
         if traffic_user > 59: return 2
-        if traffic_user == 0: return 0
         return 1
     elif band == 'L': # 15MHZ
         if traffic_user > 169: return 4
         if traffic_user > 119: return 3
         if traffic_user > 67: return 2
-        if traffic_user == 0: return 0
         return 1
     elif band == 'K': # 15MHZ
         if traffic_user > 134: return 4
         if traffic_user > 89: return 3
         if traffic_user > 52: return 2
-        if traffic_user == 0: return 0
         return 1
     elif band == 'H': # 20MHZ
         if traffic_user > 179: return 4
         if traffic_user > 119: return 3
         if traffic_user > 69: return 2
-        if traffic_user == 0: return 0
         return 1
     elif band == 'V': # 20MHZ
         if traffic_user > 719: return 4
         if traffic_user > 479: return 3
         if traffic_user > 279: return 2
-        if traffic_user == 0: return 0
         return 1
 
     return np.nan
@@ -202,10 +179,10 @@ def calculate_prb_score(prb_dl):
     if pd.isna(prb_dl):
         return np.nan
 
+    if prb_dl == 0: return 0 # Special handling for zero, as per earlier
     if prb_dl > 79: return 4
     if prb_dl > 59: return 3
     if prb_dl > 24: return 2
-    if prb_dl == 0: return 0
     return 1
 
 def get_color_code(row, color_matrix):
@@ -216,6 +193,10 @@ def get_color_code(row, color_matrix):
         return np.nan
 
     lookup_key = (concat_score, bandwidth)
+
+    # Special rule: If Concatenated Score is "00", force color to BLACK
+    if concat_score == "00":
+        return "BLACK"
 
     return color_matrix.get(lookup_key, 'UNKNOWN_COLOR')
 
@@ -232,22 +213,14 @@ def get_final_assessment(row):
     if pd.isna(cell_level_congestion) or pd.isna(good_cells_count_in_sector) or pd.isna(red_cells_count_in_sector):
         return "-" # Default for missing data
 
-    # New logic based on your clarification:
-    # If a certain cell is RED, then it checks if Good_cells_count_in_sector >= Red_cells_count_in_sector.
-    # If true, returns "FOR TRAFFIC BALANCING".
-    # Otherwise (if RED cell AND Good < Red), it returns "NEED EXPANSION".
     if cell_level_congestion == 'RED':
         if good_cells_count_in_sector >= red_cells_count_in_sector:
             return "FOR TRAFFIC BALANCING"
-        else: # cell_level_congestion is RED AND red_cells_count_in_sector > good_cells_count_in_sector
+        else:
             return "NEED EXPANSION"
-    # If the cell itself is NOT RED (e.g., Green, Amber, Yellow, Blue, Black, Unknown)
-    # The condition for these is ONLY 'NEED EXPANSION' if red_cells_count_in_sector > good_cells_count_in_sector,
-    # otherwise, it's 'NOT CONGESTED'.
     else: 
         if red_cells_count_in_sector > good_cells_count_in_sector:
             return "NEED EXPANSION"
-        # If not "NEED EXPANSION", it's "NOT CONGESTED" for non-red cells in good/balanced sectors
         else: 
             return "NOT CONGESTED"
 
@@ -258,27 +231,22 @@ def get_cell_to_sector_color_coding(row):
     amber_count = row['Amber_Cells_Count']
     total_count = row['Total_Cells_in_Sector_Band']
 
-    if pd.isna(total_count) or total_count == 0:
-        return np.nan # No cells in this group to assess
+    if pd.isna(total_count) or pd.isna(black_count) or pd.isna(red_count) or pd.isna(amber_count): # Check all inputs
+        return np.nan
 
-    # Condition 1: If BLACK CELLS/TOTAL = 100%
     if black_count == total_count:
         return "BLACK"
 
-    # Omit black cells for subsequent conditions
     effective_total = total_count - black_count
     if effective_total <= 0: # If all non-black cells were effectively removed (e.g., all black or only NaN colors)
         return np.nan # Or a specific indicator if you prefer, like "N/A_NON_BLACK"
 
-    # Condition 2: IF RED CELLS/TOTAL > 50% (using effective_total)
     if (red_count / effective_total) > 0.5:
         return "RED"
 
-    # Condition 3: IF (RED+AMBER)/TOTAL >= 50% (using effective_total)
     if ((red_count + amber_count) / effective_total) >= 0.5:
         return "AMBER"
         
-    # Fallback: If none of the above conditions are met, it's GREEN
     return "GREEN"
 
 
@@ -328,17 +296,17 @@ def process_congestion_data(raw_df):
             st.warning(f"Column '{col}' not found in the uploaded file. Using 'N/A' as placeholder.")
 
     # --- Automate CATEGORY based on Date column (now 'Date' and 'CATEGORY' are guaranteed to exist) ---
-    if df['Date'].astype(str).str.strip().str.lower() != 'n/a': # Only process if 'Date' column has actual data
+    if not df['Date'].astype(str).str.strip().str.lower().eq('n/a').all(): 
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', infer_datetime_format=True)
         original_rows_before_date_dropna = len(df)
-        df.dropna(subset=['Date'], inplace=True) # Drop rows where Date could not be parsed
+        df.dropna(subset=['Date'], inplace=True) 
         if len(df) < original_rows_before_date_dropna:
             st.warning(f"Dropped {original_rows_before_date_dropna - len(df)} rows due to unparseable dates.")
         
         df['CATEGORY'] = df['Date'].apply(lambda x: 'weekend' if pd.notna(x) and x.weekday() >= 5 else 'weekday')
         st.success("Date column processed and CATEGORY automated!")
     else: # 'Date' column was missing or all 'N/A', try to use existing CATEGORY or keep 'N/A'
-        if df['CATEGORY'].astype(str).str.strip().str.lower() != 'n/a': # Check if existing CATEGORY has actual data
+        if not df['CATEGORY'].astype(str).str.strip().str.lower().eq('n/a').all() and not df['CATEGORY'].isnull().all():
             df['CATEGORY'] = df['CATEGORY'].astype(str).str.lower()
             df.loc[df['CATEGORY'] == 'nan', 'CATEGORY'] = np.nan # Ensure 'nan' string is actual NaN
             st.success("Using existing 'CATEGORY' column.")
@@ -347,7 +315,6 @@ def process_congestion_data(raw_df):
 
 
     # --- Capture ALL unique Cell Names and their associated metadata from the ORIGINAL DataFrame first ---
-    # All columns used here are guaranteed to exist now due to initial checks
     all_original_cell_names = df[['Cell Name', 'Province', 'Town', 'Vendor']].drop_duplicates().reset_index(drop=True)
 
 
@@ -374,9 +341,9 @@ def process_congestion_data(raw_df):
         elif pd.isna(weekend_val):
             final_prb_values[cell_name] = all_days_val
         else:
-            # Explicitly compare non-NaN values
             final_prb_values[cell_name] = all_days_val if all_days_val >= weekend_val else weekend_val
-    final_prb_series = pd.Series(final_prb_values, name='Final PRB')
+    # Fill NaN values with 0 here to explicitly represent zero data
+    final_prb_series = pd.Series(final_prb_values, name='Final PRB').fillna(0)
 
     # --- L.Traffic.User.Avg Computation ---
     all_days_traffic_computed = df.groupby('Cell Name')['L.Traffic.User.Avg'].apply(compute_all_days_value).rename('All_Days_Computed_Traffic')
@@ -396,9 +363,9 @@ def process_congestion_data(raw_df):
         elif pd.isna(weekend_val):
             final_traffic_values[cell_name] = all_days_val
         else:
-            # Explicitly compare non-NaN values
             final_traffic_values[cell_name] = all_days_val if all_days_val >= weekend_val else weekend_val
-    final_traffic_series = pd.Series(final_traffic_values, name='Final Traffic')
+    # Fill NaN values with 0 here to explicitly represent zero data
+    final_traffic_series = pd.Series(final_traffic_values, name='Final Traffic').fillna(0)
 
     # --- Combine Final PRB and Traffic Results with all original Cell Names, Province, and Town ---
     computed_metrics = pd.DataFrame({
@@ -428,6 +395,7 @@ def process_congestion_data(raw_df):
         if pd.notna(row['PRB_DL_Usage Score']) and pd.notna(row['L.Traffic.User.Avg Score'])
         else np.nan, axis=1
     )
+    # The get_color_code function handles "00" score to "BLACK"
     final_results_df['Color Code'] = final_results_df.apply(lambda row: get_color_code(row, color_matrix), axis=1)
     final_results_df['Color Code'] = final_results_df['Color Code'].apply(lambda x: x.upper() if pd.notna(x) else x)
 
@@ -437,9 +405,8 @@ def process_congestion_data(raw_df):
     }, inplace=True)
 
     # --- Prepare for FINAL ASSESSMENT (Sector-level counts) ---
-    # These calculations now use the already renamed 'Cell Level Congestion'
     final_results_df['Is_Good_Cell'] = final_results_df['Cell Level Congestion'].isin(['BLUE', 'GREEN'])
-    final_results_df['Is_Red_Cell'] = final_results_df['Cell Level Congestion'] == 'RED' # Keep this for Red_Cells_Count_Sector
+    final_results_df['Is_Red_Cell'] = final_results_df['Cell Level Congestion'] == 'RED'
 
     # Aggregate Good and Red cell counts per sector based on unique cells
     sector_level_agg_data = final_results_df.drop_duplicates(subset=['Cell Name', 'SECTORNAME']).groupby('SECTORNAME').agg(
@@ -459,15 +426,14 @@ def process_congestion_data(raw_df):
     final_results_df['FINAL ASSESSMENT'] = final_results_df.apply(get_final_assessment, axis=1)
 
     # --- CELL TO SECTOR COLOR CODING Column ---
-    # Ensure these are based on the correct 'Cell Level Congestion' column
     final_results_df['Is_Black_Cell'] = final_results_df['Cell Level Congestion'] == 'BLACK'
     final_results_df['Is_Amber_Cell'] = final_results_df['Cell Level Congestion'] == 'AMBER'
     
     # Re-aggregate counts for sector_band_color_counts based on Cell Level Congestion (using unique cells per sector/band)
     sector_band_color_counts = final_results_df.drop_duplicates(subset=['Cell Name', 'SECTORNAME', 'BAND']).groupby(['SECTORNAME', 'BAND']).agg(
-        Black_Cells_Count=('Is_Black_Cell', 'sum'), # Correctly referencing boolean column
-        Red_Cells_Count_for_CTSCC=('Is_Red_Cell', 'sum'), # Correctly referencing boolean column
-        Amber_Cells_Count=('Is_Amber_Cell', 'sum'), # Correctly referencing boolean column
+        Black_Cells_Count=('Is_Black_Cell', 'sum'), 
+        Red_Cells_Count_for_CTSCC=('Is_Red_Cell', 'sum'), 
+        Amber_Cells_Count=('Is_Amber_Cell', 'sum'), 
         Total_Cells_in_Sector_Band=('Cell Name', 'count')
     ).reset_index()
 
@@ -484,7 +450,7 @@ def process_congestion_data(raw_df):
 
     # Clean up temporary columns
     final_results_df.drop(columns=[
-        'Is_Good_Cell', 'Is_Red_Cell', 'Is_Black_Cell', 'Is_Amber_Cell', # These are temporary boolean flags
+        'Is_Good_Cell', 'Is_Red_Cell', 'Is_Black_Cell', 'Is_Amber_Cell', 
     ], inplace=True) 
 
     # Reorder columns for better readability
@@ -530,59 +496,6 @@ if raw_df_single_file is not None:
         final_results_df = process_congestion_data(raw_df_single_file)
         st.header("2. Data Processing & Analysis")
         st.success("Data processing and analysis complete!")
-        # Debugging output: Display intermediate calculation results
-        st.subheader("Debugging: Intermediate KPI Computations (Sample)")
-        
-        # Filter for the specific Cell Name from the example
-        # The Cell Name from the image is 'TCPHTMACARTHURILOILOILOF-3_4TRFS'
-        example_cell_name = "TCPHTMACARTHURILOILOILOF-3_4TRFS" # Hardcoded for the provided example
-        
-        # Check if the example cell name exists in the processed data
-        if example_cell_name in raw_df_single_file['Cell Name'].unique():
-            # Get all relevant data for this cell
-            cell_data_for_debug = raw_df_single_file[raw_df_single_file['Cell Name'] == example_cell_name].copy()
-            
-            # Ensure 'CATEGORY' is correctly populated for debug data
-            if 'Date' in cell_data_for_debug.columns:
-                cell_data_for_debug['Date'] = pd.to_datetime(cell_data_for_debug['Date'], errors='coerce', infer_datetime_format=True)
-                cell_data_for_debug['CATEGORY'] = cell_data_for_debug['Date'].apply(lambda x: 'weekend' if pd.notna(x) and x.weekday() >= 5 else 'weekday')
-            elif 'CATEGORY' not in cell_data_for_debug.columns:
-                cell_data_for_debug['CATEGORY'] = 'N/A' # Fallback
-                
-            # Ensure only numeric values are used for debug view
-            cell_data_for_debug['PRB_DL_Usage_numeric'] = pd.to_numeric(cell_data_for_debug['PRB_DL_Usage'], errors='coerce')
-            cell_data_for_debug['L.Traffic.User.Avg_numeric'] = pd.to_numeric(cell_data_for_debug['L.Traffic.User.Avg'], errors='coerce')
-
-            st.write(f"**Data for Cell: {example_cell_name}**")
-            st.dataframe(cell_data_for_debug[['Date', 'CATEGORY', 'L.Traffic.User.Avg_numeric', 'PRB_DL_Usage_numeric']], use_container_width=True)
-
-            # Calculate all-days computed value
-            all_days_prb_debug = compute_all_days_value(cell_data_for_debug['PRB_DL_Usage_numeric'])
-            all_days_traffic_debug = compute_all_days_value(cell_data_for_debug['L.Traffic.User.Avg_numeric'])
-            st.write(f"  - All Days Computed PRB (Top N avg): {all_days_prb_debug}")
-            st.write(f"  - All Days Computed Traffic (Top N avg): {all_days_traffic_debug}")
-
-            # Calculate weekend computed value
-            weekend_prb_debug = get_weekend_value(cell_data_for_debug[cell_data_for_debug['CATEGORY'] == 'weekend']['PRB_DL_Usage_numeric'])
-            weekend_traffic_debug = get_weekend_value(cell_data_for_debug[cell_data_for_debug['CATEGORY'] == 'weekend']['L.Traffic.User.Avg_numeric'])
-            st.write(f"  - Weekend Computed PRB: {weekend_prb_debug}")
-            st.write(f"  - Weekend Computed Traffic: {weekend_traffic_debug}")
-
-            # Final comparison
-            final_prb_calc = all_days_prb_debug
-            if pd.notna(weekend_prb_debug) and (pd.isna(final_prb_calc) or weekend_prb_debug > final_prb_calc):
-                final_prb_calc = weekend_prb_debug
-
-            final_traffic_calc = all_days_traffic_debug
-            if pd.notna(weekend_traffic_debug) and (pd.isna(final_traffic_calc) or weekend_traffic_debug > final_traffic_calc):
-                final_traffic_calc = weekend_traffic_debug
-
-            st.write(f"  - **Final PRB (max): {final_prb_calc}**")
-            st.write(f"  - **Final Traffic (max): {final_traffic_calc}**")
-        else:
-            st.info(f"Sample cell '{example_cell_name}' not found in the uploaded data for debugging.")
-        st.markdown("---")
-
         st.write(f"Total rows in final processed data: {len(final_results_df)}")
         st.write(f"Total unique 'Cell Name' in final processed data: {final_results_df['Cell Name'].nunique()}")
 
