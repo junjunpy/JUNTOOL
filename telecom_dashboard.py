@@ -15,7 +15,7 @@ st.set_page_config(
 st.title("📡 Cell Congestion Analysis Dashboard")
 st.markdown("Upload your CSV file(s) to analyze cell and sector congestion. This dashboard provides a detailed breakdown of cell performance and overall network health.")
 
-# --- Helper Functions (not directly cached here, but called within the main cached function) ---
+# --- Helper Functions (defined at the top for proper scope) ---
 
 def get_top_n_avg(series, n=4):
     """
@@ -34,33 +34,37 @@ def get_top_n_avg(series, n=4):
 def get_weekend_value(series):
     """
     Computes the weekend value based on specific rules for two weekend days:
-    - Drop NaNs first.
-    - If there are two non-NaN values:
-        - If one is 0 and the other is non-0, select the non-0 value.
-        - Otherwise (both non-0, or both 0), average them.
-    - If there is 1 non-NaN value, use that value.
-    - If 0 non-NaN values, return NaN.
+    - Only considers non-zero values for average.
+    - If only one non-zero value, use that value.
+    - If both are non-zero, average them.
+    - Returns NaN if no non-zero weekend values.
     """
-    series_clean = series.dropna().reset_index(drop=True) # Reset index to use iloc safely
-    num_values = len(series_clean)
+    series_non_zero_weekend = series.dropna()[series.dropna() != 0] # Filter for non-NaN and non-zero values
+    num_non_zero_weekend = len(series_non_zero_weekend)
 
-    if num_values == 0:
+    if num_non_zero_weekend == 0:
         return np.nan
-    elif num_values == 1:
-        return series_clean.iloc[0]
-    elif num_values == 2:
-        val1 = series_clean.iloc[0]
-        val2 = series_clean.iloc[1]
+    elif num_non_zero_weekend == 1:
+        return series_non_zero_weekend.iloc[0]
+    else: # num_non_zero_weekend >= 2 (implies 2 non-zero values for weekends)
+        return series_non_zero_weekend.mean()
 
-        # Case: one value is 0 and the other is non-0
-        if (val1 == 0 and val2 != 0):
-            return val2
-        elif (val2 == 0 and val1 != 0):
-            return val1
-        else: # Case: both are non-zero, or both are zero
-            return series_clean.mean()
-    else: # Should ideally not happen if 'weekend' category always has at most 2 days per cell
-        return series_clean.mean() # Fallback to original mean if more than 2 weekend values for some reason
+def compute_all_days_value(series):
+    """
+    Computes the 'all days' value based on non-zero values and count.
+    - If less than 4 non-zero values, average them.
+    - If 4 or more non-zero values, average the top 4 highest non-zero values.
+    - Returns NaN if no non-zero values.
+    """
+    series_non_zero = series.dropna()[series.dropna() != 0] # Filter for non-NaN and non-zero values
+    count_non_zero = len(series_non_zero)
+
+    if count_non_zero == 0:
+        return np.nan
+    elif count_non_zero < 4:
+        return series_non_zero.mean()
+    else: # count_non_zero >= 4
+        return series_non_zero.nlargest(4).mean()
 
 def parse_cell_name_refined(cell_name):
     sitename = np.nan
@@ -316,93 +320,84 @@ def process_congestion_data(raw_df):
     """
     df = raw_df.copy() # Work on a copy to avoid modifying the original DataFrame in cache
 
-    # --- Guaranteed CATEGORY Column Initialization ---
-    # Initialize CATEGORY column to prevent KeyError
-    df['CATEGORY'] = 'N/A' # Default value if neither 'Date' nor existing 'CATEGORY' found
+    # --- Ensure all required columns exist with placeholders at the very beginning ---
+    required_cols = ['Date', 'CATEGORY', 'Province', 'Town', 'Vendor']
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = 'N/A' # Default to 'N/A' if column is entirely missing
+            st.warning(f"Column '{col}' not found in the uploaded file. Using 'N/A' as placeholder.")
 
-    # --- Automate CATEGORY based on Date column ---
-    if 'Date' in df.columns:
+    # --- Automate CATEGORY based on Date column (now 'Date' and 'CATEGORY' are guaranteed to exist) ---
+    if df['Date'].astype(str).str.strip().str.lower() != 'n/a': # Only process if 'Date' column has actual data
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', infer_datetime_format=True)
-        # Drop rows where Date could not be parsed as they are unusable for CATEGORY
         original_rows_before_date_dropna = len(df)
-        df.dropna(subset=['Date'], inplace=True) 
+        df.dropna(subset=['Date'], inplace=True) # Drop rows where Date could not be parsed
         if len(df) < original_rows_before_date_dropna:
             st.warning(f"Dropped {original_rows_before_date_dropna - len(df)} rows due to unparseable dates.")
         
-        df['CATEGORY'] = df['Date'].apply(lambda x: 'weekend' if x.weekday() >= 5 else 'weekday')
+        df['CATEGORY'] = df['Date'].apply(lambda x: 'weekend' if pd.notna(x) and x.weekday() >= 5 else 'weekday')
         st.success("Date column processed and CATEGORY automated!")
-    else:
-        st.warning("No 'Date' column found. Attempting to use existing 'CATEGORY' column.")
-        if 'CATEGORY' in df.columns and not df['CATEGORY'].isnull().all(): # Check if it exists and has non-nulls
+    else: # 'Date' column was missing or all 'N/A', try to use existing CATEGORY or keep 'N/A'
+        if df['CATEGORY'].astype(str).str.strip().str.lower() != 'n/a': # Check if existing CATEGORY has actual data
             df['CATEGORY'] = df['CATEGORY'].astype(str).str.lower()
             df.loc[df['CATEGORY'] == 'nan', 'CATEGORY'] = np.nan # Ensure 'nan' string is actual NaN
             st.success("Using existing 'CATEGORY' column.")
         else:
-            st.warning("Neither 'Date' nor a valid 'CATEGORY' column found. 'CATEGORY' set to 'N/A' for all rows.")
-
-
-    # Ensure 'Province', 'Town', and 'Vendor' columns exist and are handled. If not present, create placeholders.
-    if 'Province' not in df.columns:
-        df['Province'] = 'N/A'
-        st.warning("No 'Province' column found in the uploaded file. Using 'N/A' as placeholder.")
-    if 'Town' not in df.columns:
-        df['Town'] = 'N/A'
-        st.warning("No 'Town' column found in the uploaded file. Using 'N/A' as placeholder.")
-    if 'Vendor' not in df.columns: # NEW: Check for 'Vendor' column
-        df['Vendor'] = 'N/A'
-        st.warning("No 'Vendor' column found in the uploaded file. Using 'N/A' as placeholder.")
+            st.info("Neither valid 'Date' nor existing 'CATEGORY' column found. 'CATEGORY' remains 'N/A'.")
 
 
     # --- Capture ALL unique Cell Names and their associated metadata from the ORIGINAL DataFrame first ---
+    # All columns used here are guaranteed to exist now due to initial checks
     all_original_cell_names = df[['Cell Name', 'Province', 'Town', 'Vendor']].drop_duplicates().reset_index(drop=True)
 
 
     # --- Data Cleaning (continued) ---
     df['PRB_DL_Usage'] = pd.to_numeric(df['PRB_DL_Usage'], errors='coerce')
     df['L.Traffic.User.Avg'] = pd.to_numeric(df['L.Traffic.User.Avg'], errors='coerce')
-    # CATEGORY is handled above, so no need for general standardization here.
     df.dropna(subset=['PRB_DL_Usage', 'L.Traffic.User.Avg'], how='all', inplace=True)
 
     # --- PRB_DL_Usage Computation ---
-    all_days_prb_avg = df.groupby('Cell Name')['PRB_DL_Usage'].apply(get_top_n_avg, n=4).rename('All_Days_Top4_Avg_PRB')
+    all_days_prb_computed = df.groupby('Cell Name')['PRB_DL_Usage'].apply(compute_all_days_value).rename('All_Days_Computed_PRB')
     weekend_only_prb_computed = df[df['CATEGORY'] == 'weekend'].groupby('Cell Name')['PRB_DL_Usage'].apply(get_weekend_value).rename('Weekend_Computed_PRB')
     
-    prb_comparison_df = pd.merge(all_days_prb_avg, weekend_only_prb_computed, on='Cell Name', how='outer')
+    prb_comparison_df = pd.merge(all_days_prb_computed, weekend_only_prb_computed, on='Cell Name', how='outer')
 
     final_prb_values = {}
     for cell_name in prb_comparison_df.index:
-        all_days_avg = prb_comparison_df.loc[cell_name, 'All_Days_Top4_Avg_PRB']
+        all_days_val = prb_comparison_df.loc[cell_name, 'All_Days_Computed_PRB']
         weekend_val = prb_comparison_df.loc[cell_name, 'Weekend_Computed_PRB']
 
-        if pd.isna(all_days_avg) and pd.isna(weekend_val):
+        if pd.isna(all_days_val) and pd.isna(weekend_val):
             final_prb_values[cell_name] = np.nan
-        elif pd.isna(all_days_avg):
+        elif pd.isna(all_days_val):
             final_prb_values[cell_name] = weekend_val
         elif pd.isna(weekend_val):
-            final_prb_values[cell_name] = all_days_avg
+            final_prb_values[cell_name] = all_days_val
         else:
-            final_prb_values[cell_name] = max(all_days_avg, weekend_val) 
+            # Explicitly compare non-NaN values
+            final_prb_values[cell_name] = all_days_val if all_days_val >= weekend_val else weekend_val
     final_prb_series = pd.Series(final_prb_values, name='Final PRB')
 
     # --- L.Traffic.User.Avg Computation ---
-    all_days_traffic_avg = df.groupby('Cell Name')['L.Traffic.User.Avg'].apply(get_top_n_avg, n=4).rename('All_Days_Top4_Avg_Traffic')
+    all_days_traffic_computed = df.groupby('Cell Name')['L.Traffic.User.Avg'].apply(compute_all_days_value).rename('All_Days_Computed_Traffic')
     weekend_only_traffic_computed = df[df['CATEGORY'] == 'weekend'].groupby('Cell Name')['L.Traffic.User.Avg'].apply(get_weekend_value).rename('Weekend_Computed_Traffic')
     
-    traffic_comparison_df = pd.merge(all_days_traffic_avg, weekend_only_traffic_computed, on='Cell Name', how='outer')
+    traffic_comparison_df = pd.merge(all_days_traffic_computed, weekend_only_traffic_computed, on='Cell Name', how='outer')
 
     final_traffic_values = {}
     for cell_name in traffic_comparison_df.index:
-        all_days_avg = traffic_comparison_df.loc[cell_name, 'All_Days_Top4_Avg_Traffic']
+        all_days_val = traffic_comparison_df.loc[cell_name, 'All_Days_Computed_Traffic']
         weekend_val = traffic_comparison_df.loc[cell_name, 'Weekend_Computed_Traffic']
 
-        if pd.isna(all_days_avg) and pd.isna(weekend_val):
+        if pd.isna(all_days_val) and pd.isna(weekend_val):
             final_traffic_values[cell_name] = np.nan
-        elif pd.isna(all_days_avg):
+        elif pd.isna(all_days_val):
             final_traffic_values[cell_name] = weekend_val
         elif pd.isna(weekend_val):
-            final_traffic_values[cell_name] = all_days_avg
+            final_traffic_values[cell_name] = all_days_val
         else:
-            final_traffic_values[cell_name] = max(all_days_avg, weekend_val) 
+            # Explicitly compare non-NaN values
+            final_traffic_values[cell_name] = all_days_val if all_days_val >= weekend_val else weekend_val
     final_traffic_series = pd.Series(final_traffic_values, name='Final Traffic')
 
     # --- Combine Final PRB and Traffic Results with all original Cell Names, Province, and Town ---
@@ -437,7 +432,6 @@ def process_congestion_data(raw_df):
     final_results_df['Color Code'] = final_results_df['Color Code'].apply(lambda x: x.upper() if pd.notna(x) else x)
 
     # --- RENAME 'Color Code' to 'Cell Level Congestion' ---
-    # Perform renaming earlier so subsequent logic uses the correct names
     final_results_df.rename(columns={
         'Color Code': 'Cell Level Congestion',
     }, inplace=True)
@@ -481,9 +475,6 @@ def process_congestion_data(raw_df):
     sector_band_color_counts['Sector Level Congestion Temp'] = sector_band_color_counts.apply(get_cell_to_sector_color_coding, axis=1) 
     
     # Rename 'CELL TO SECTOR COLOR CODING' to 'Sector Level Congestion' AFTER its calculation
-    # Since it's being created and merged with a temp name, then renamed, this should be fine.
-    # The previous rename for 'CELL TO SECTOR COLOR CODING' was causing the KeyError
-    # by renaming a column that didn't exist yet at that specific point.
     final_results_df = pd.merge(
         final_results_df,
         sector_band_color_counts[['SECTORNAME', 'BAND', 'Sector Level Congestion Temp']],
@@ -494,7 +485,7 @@ def process_congestion_data(raw_df):
     # Clean up temporary columns
     final_results_df.drop(columns=[
         'Is_Good_Cell', 'Is_Red_Cell', 'Is_Black_Cell', 'Is_Amber_Cell', # These are temporary boolean flags
-    ], inplace=True) # Good_Cells_Count_Sector and Red_Cells_Count_Sector are retained as they are used in get_final_assessment
+    ], inplace=True) 
 
     # Reorder columns for better readability
     ordered_columns = [
@@ -539,6 +530,59 @@ if raw_df_single_file is not None:
         final_results_df = process_congestion_data(raw_df_single_file)
         st.header("2. Data Processing & Analysis")
         st.success("Data processing and analysis complete!")
+        # Debugging output: Display intermediate calculation results
+        st.subheader("Debugging: Intermediate KPI Computations (Sample)")
+        
+        # Filter for the specific Cell Name from the example
+        # The Cell Name from the image is 'TCPHTMACARTHURILOILOILOF-3_4TRFS'
+        example_cell_name = "TCPHTMACARTHURILOILOILOF-3_4TRFS" # Hardcoded for the provided example
+        
+        # Check if the example cell name exists in the processed data
+        if example_cell_name in raw_df_single_file['Cell Name'].unique():
+            # Get all relevant data for this cell
+            cell_data_for_debug = raw_df_single_file[raw_df_single_file['Cell Name'] == example_cell_name].copy()
+            
+            # Ensure 'CATEGORY' is correctly populated for debug data
+            if 'Date' in cell_data_for_debug.columns:
+                cell_data_for_debug['Date'] = pd.to_datetime(cell_data_for_debug['Date'], errors='coerce', infer_datetime_format=True)
+                cell_data_for_debug['CATEGORY'] = cell_data_for_debug['Date'].apply(lambda x: 'weekend' if pd.notna(x) and x.weekday() >= 5 else 'weekday')
+            elif 'CATEGORY' not in cell_data_for_debug.columns:
+                cell_data_for_debug['CATEGORY'] = 'N/A' # Fallback
+                
+            # Ensure only numeric values are used for debug view
+            cell_data_for_debug['PRB_DL_Usage_numeric'] = pd.to_numeric(cell_data_for_debug['PRB_DL_Usage'], errors='coerce')
+            cell_data_for_debug['L.Traffic.User.Avg_numeric'] = pd.to_numeric(cell_data_for_debug['L.Traffic.User.Avg'], errors='coerce')
+
+            st.write(f"**Data for Cell: {example_cell_name}**")
+            st.dataframe(cell_data_for_debug[['Date', 'CATEGORY', 'L.Traffic.User.Avg_numeric', 'PRB_DL_Usage_numeric']], use_container_width=True)
+
+            # Calculate all-days computed value
+            all_days_prb_debug = compute_all_days_value(cell_data_for_debug['PRB_DL_Usage_numeric'])
+            all_days_traffic_debug = compute_all_days_value(cell_data_for_debug['L.Traffic.User.Avg_numeric'])
+            st.write(f"  - All Days Computed PRB (Top N avg): {all_days_prb_debug}")
+            st.write(f"  - All Days Computed Traffic (Top N avg): {all_days_traffic_debug}")
+
+            # Calculate weekend computed value
+            weekend_prb_debug = get_weekend_value(cell_data_for_debug[cell_data_for_debug['CATEGORY'] == 'weekend']['PRB_DL_Usage_numeric'])
+            weekend_traffic_debug = get_weekend_value(cell_data_for_debug[cell_data_for_debug['CATEGORY'] == 'weekend']['L.Traffic.User.Avg_numeric'])
+            st.write(f"  - Weekend Computed PRB: {weekend_prb_debug}")
+            st.write(f"  - Weekend Computed Traffic: {weekend_traffic_debug}")
+
+            # Final comparison
+            final_prb_calc = all_days_prb_debug
+            if pd.notna(weekend_prb_debug) and (pd.isna(final_prb_calc) or weekend_prb_debug > final_prb_calc):
+                final_prb_calc = weekend_prb_debug
+
+            final_traffic_calc = all_days_traffic_debug
+            if pd.notna(weekend_traffic_debug) and (pd.isna(final_traffic_calc) or weekend_traffic_debug > final_traffic_calc):
+                final_traffic_calc = weekend_traffic_debug
+
+            st.write(f"  - **Final PRB (max): {final_prb_calc}**")
+            st.write(f"  - **Final Traffic (max): {final_traffic_calc}**")
+        else:
+            st.info(f"Sample cell '{example_cell_name}' not found in the uploaded data for debugging.")
+        st.markdown("---")
+
         st.write(f"Total rows in final processed data: {len(final_results_df)}")
         st.write(f"Total unique 'Cell Name' in final processed data: {final_results_df['Cell Name'].nunique()}")
 
